@@ -4,7 +4,7 @@ Param(
     [Switch]$StaHost
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 If ([String]::IsNullOrWhiteSpace($PSCommandPath)) {
     Write-Error "[ERROR] Run this script from a file path."
