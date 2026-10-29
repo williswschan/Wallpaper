@@ -85,6 +85,9 @@ Add-Type -AssemblyName WindowsBase
 $WifiMonitorSource = @'
 using System;
 using System.Collections.Generic;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -157,6 +160,8 @@ public static class WifiMonitor
                 }
 
                 List<string> connectedNames = new List<string>();
+                List<Guid> connectedInterfaces = new List<Guid>();
+                bool anyConnecting = false;
                 bool anyRadioOn = false;
                 bool anyRadioOff = false;
                 bool radioStateKnown = false;
@@ -169,7 +174,14 @@ public static class WifiMonitor
 
                     if (state == 1)
                     {
+                        connectedInterfaces.Add(interfaceGuid);
                         connectedNames.Add(QueryConnectedName(handle, interfaceGuid));
+                        continue;
+                    }
+
+                    if (state == 5 || state == 6 || state == 7)
+                    {
+                        anyConnecting = true;
                         continue;
                     }
 
@@ -188,9 +200,25 @@ public static class WifiMonitor
                     }
                 }
 
-                if (connectedNames.Count > 0)
+                if (connectedInterfaces.Count > 0)
                 {
-                    return new WifiSnapshot("Connected", JoinNetworkNames(connectedNames));
+                    string names = JoinNetworkNames(connectedNames);
+                    if (!HasUsableAddress(connectedInterfaces))
+                    {
+                        if (names.StartsWith("Network: "))
+                        {
+                            return new WifiSnapshot("Connecting", names);
+                        }
+
+                        return new WifiSnapshot("Connecting", "Waiting for an address from the network.");
+                    }
+
+                    return new WifiSnapshot("Connected", names);
+                }
+
+                if (anyConnecting)
+                {
+                    return new WifiSnapshot("Connecting", "Connecting to the Wi-Fi network.");
                 }
 
                 if (radioStateKnown && anyRadioOff && !anyRadioOn)
@@ -242,6 +270,83 @@ public static class WifiMonitor
         }
 
         return "Connected. The network name could not be read.";
+    }
+
+    private static bool HasUsableAddress(List<Guid> interfaceGuids)
+    {
+        try
+        {
+            NetworkInterface[] adapters = NetworkInterface.GetAllNetworkInterfaces();
+            for (int index = 0; index < interfaceGuids.Count; index++)
+            {
+                string withBraces = interfaceGuids[index].ToString("B");
+                string plain = interfaceGuids[index].ToString("D");
+                for (int adapterIndex = 0; adapterIndex < adapters.Length; adapterIndex++)
+                {
+                    NetworkInterface adapter = adapters[adapterIndex];
+                    if (adapter.NetworkInterfaceType != NetworkInterfaceType.Wireless80211)
+                    {
+                        continue;
+                    }
+
+                    if (adapter.OperationalStatus != OperationalStatus.Up)
+                    {
+                        continue;
+                    }
+
+                    if (!string.Equals(adapter.Id, withBraces, StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(adapter.Id, plain, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    foreach (UnicastIPAddressInformation address in adapter.GetIPProperties().UnicastAddresses)
+                    {
+                        if (IsUsableAddress(address.Address))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool IsUsableAddress(IPAddress address)
+    {
+        if (address == null || IPAddress.IsLoopback(address))
+        {
+            return false;
+        }
+
+        if (address.AddressFamily == AddressFamily.InterNetwork)
+        {
+            byte[] bytes = address.GetAddressBytes();
+            if (bytes.Length != 4 || bytes[0] == 0)
+            {
+                return false;
+            }
+
+            if (bytes[0] == 169 && bytes[1] == 254)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        if (address.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            return !address.IsIPv6LinkLocal;
+        }
+
+        return false;
     }
 
     private static string QueryConnectedName(IntPtr handle, Guid interfaceGuid)
@@ -555,6 +660,141 @@ If ($Null -Eq ([System.Management.Automation.PSTypeName]"CiscoBrowserCloser").Ty
     Add-Type -TypeDefinition $CiscoBrowserSource -Language CSharp
 }
 
+$CiscoFailoverNoticeSource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class CiscoFailoverNotice
+{
+    private const string NoticeMarker = "retry logging on with the service provider";
+    private static bool FoundNotice;
+    private static IntPtr OkButton;
+
+    public static bool TryDismiss()
+    {
+        try
+        {
+            FoundNotice = false;
+            OkButton = IntPtr.Zero;
+            EnumWindows(OnWindow, IntPtr.Zero);
+            if (!FoundNotice || OkButton == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            PostMessage(OkButton, 0x00F5, IntPtr.Zero, IntPtr.Zero);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static bool OnWindow(IntPtr handle, IntPtr lParam)
+    {
+        if (!IsWindowVisible(handle))
+        {
+            return true;
+        }
+
+        FoundNotice = false;
+        OkButton = IntPtr.Zero;
+        EnumChildWindows(handle, OnChild, IntPtr.Zero);
+        if (FoundNotice && OkButton != IntPtr.Zero)
+        {
+            return false;
+        }
+
+        FoundNotice = false;
+        OkButton = IntPtr.Zero;
+        return true;
+    }
+
+    private static bool OnChild(IntPtr handle, IntPtr lParam)
+    {
+        string text = ReadText(handle);
+        if (text.IndexOf(NoticeMarker, StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            FoundNotice = true;
+        }
+
+        if (IsOkButton(text) && IsButton(handle))
+        {
+            OkButton = handle;
+        }
+
+        return true;
+    }
+
+    private static bool IsOkButton(string name)
+    {
+        if (name == null)
+        {
+            return false;
+        }
+
+        string trimmed = name.Replace("&", "").Trim();
+        return string.Equals(trimmed, "OK", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsButton(IntPtr handle)
+    {
+        string className = ReadClassName(handle);
+        if (string.Equals(className, "Button", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return className.IndexOf("BUTTON", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static string ReadText(IntPtr handle)
+    {
+        StringBuilder text = new StringBuilder(2048);
+        GetWindowText(handle, text, text.Capacity);
+        return text.ToString();
+    }
+
+    private static string ReadClassName(IntPtr handle)
+    {
+        StringBuilder text = new StringBuilder(256);
+        GetClassName(handle, text, text.Capacity);
+        return text.ToString();
+    }
+
+    private delegate bool EnumWindowsProc(IntPtr handle, IntPtr lParam);
+    private delegate bool EnumChildProc(IntPtr handle, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumChildWindows(IntPtr parent, EnumChildProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr handle);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr handle, StringBuilder text, int maxCount);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr handle, StringBuilder text, int maxCount);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PostMessage(IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
+}
+'@
+
+If ($Null -Eq ([System.Management.Automation.PSTypeName]"CiscoFailoverNotice").Type) {
+    Add-Type -TypeDefinition $CiscoFailoverNoticeSource -Language CSharp
+}
+
 $NetworkChangeRelaySource = @'
 using System;
 using System.Net.NetworkInformation;
@@ -695,6 +935,11 @@ Function Update-WifiStatus {
             $Script:StatusText.Text = "Wi-Fi connected"
             $Script:NetworkText.Text = [String]$Snapshot.Detail
         }
+        "Connecting" {
+            $Script:StatusDot.Fill = $Script:WarningBrush
+            $Script:StatusText.Text = "Wi-Fi connecting"
+            $Script:NetworkText.Text = [String]$Snapshot.Detail
+        }
         "RadioOff" {
             $Script:StatusDot.Fill = $Script:WarningBrush
             $Script:StatusText.Text = "Wi-Fi is off"
@@ -827,6 +1072,7 @@ Function Invoke-SignInPage {
     $Script:IsOpening = $True
     $Script:OpenSignInButton.IsEnabled = $False
     Write-SignInLog "[INFO] Open sign-in page clicked."
+    Start-FailoverNoticeMonitor
     $CloseRequests = [CiscoBrowserCloser]::RequestClose()
     Write-SignInLog ("[INFO] Cisco browser close requests=" + $CloseRequests)
     If ($CloseRequests -Gt 0) {
@@ -843,6 +1089,41 @@ Function Invoke-SignInPage {
     Complete-SignInLaunch -CiscoState "None"
 }
 
+Function Start-FailoverNoticeMonitor {
+    If ($Script:FailoverNoticeTimer -Ne $Null) {
+        $Script:FailoverNoticeTimer.Stop()
+    }
+
+    $Script:FailoverNoticeDeadline = (Get-Date).AddSeconds(5)
+    $Script:FailoverNoticeTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $Script:FailoverNoticeTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+    $Script:FailoverNoticeTimer.Add_Tick({ Update-FailoverNoticeMonitor })
+    $Script:FailoverNoticeTimer.Start()
+    Write-SignInLog "[INFO] Watching for the Cisco failover notice for 5 seconds."
+}
+
+Function Update-FailoverNoticeMonitor {
+    Try {
+        If ((Get-Date) -Gt $Script:FailoverNoticeDeadline) {
+            $Script:FailoverNoticeTimer.Stop()
+            Write-SignInLog "[INFO] Cisco failover notice was not shown. Monitor stopped."
+            Return
+        }
+
+        If ([CiscoFailoverNotice]::TryDismiss() -Eq $True) {
+            $Script:FailoverNoticeTimer.Stop()
+            Write-SignInLog "[INFO] Cisco failover notice was dismissed."
+        }
+    }
+    Catch {
+        If ($Script:FailoverNoticeTimer -Ne $Null) {
+            $Script:FailoverNoticeTimer.Stop()
+        }
+
+        Write-SignInLog ("[ERROR] Cisco failover notice monitor failed: " + [String]$Error[0])
+    }
+}
+
 Function Close-SignInWindow {
     If ($Script:Timer -Ne $Null) {
         $Script:Timer.Stop()
@@ -854,6 +1135,10 @@ Function Close-SignInWindow {
 
     If ($Null -Ne ([System.Management.Automation.PSTypeName]"NetworkChangeRelay").Type) {
         [NetworkChangeRelay]::Stop()
+    }
+
+    If ($Script:FailoverNoticeTimer -Ne $Null) {
+        $Script:FailoverNoticeTimer.Stop()
     }
 }
 
@@ -868,31 +1153,31 @@ $WindowXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Captive Portal Connection Helper"
-        Width="440"
+        Width="460"
         SizeToContent="Height"
         WindowStartupLocation="CenterScreen"
         Topmost="True"
         ResizeMode="CanMinimize"
-        Background="#F4F6F8"
+        Background="#F5F6F8"
         FontFamily="Segoe UI"
-        FontSize="14"
+        FontSize="13"
         UseLayoutRounding="True"
         SnapsToDevicePixels="True"
         TextOptions.TextFormattingMode="Display">
     <Window.Resources>
         <Style x:Key="SignInButtonStyle" TargetType="Button">
-            <Setter Property="Background" Value="#0B5FFF" />
+            <Setter Property="Background" Value="#1E4D7B" />
             <Setter Property="Foreground" Value="White" />
-            <Setter Property="FontSize" Value="14" />
+            <Setter Property="FontSize" Value="13" />
             <Setter Property="FontWeight" Value="SemiBold" />
-            <Setter Property="Height" Value="40" />
+            <Setter Property="Height" Value="36" />
             <Setter Property="Cursor" Value="Hand" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
                         <Border x:Name="Border"
                                 Background="{TemplateBinding Background}"
-                                CornerRadius="6"
+                                CornerRadius="4"
                                 SnapsToDevicePixels="True">
                             <ContentPresenter HorizontalAlignment="Center"
                                               VerticalAlignment="Center"
@@ -901,14 +1186,14 @@ $WindowXaml = @'
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Border" Property="Background" Value="#0848C7" />
+                                <Setter TargetName="Border" Property="Background" Value="#173E64" />
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
-                                <Setter TargetName="Border" Property="Background" Value="#063A9E" />
+                                <Setter TargetName="Border" Property="Background" Value="#12324F" />
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
-                                <Setter TargetName="Border" Property="Background" Value="#C5CDD6" />
-                                <Setter Property="Foreground" Value="#F7F8FA" />
+                                <Setter TargetName="Border" Property="Background" Value="#E6E9ED" />
+                                <Setter Property="Foreground" Value="#6B7380" />
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -916,7 +1201,7 @@ $WindowXaml = @'
             </Setter>
         </Style>
     </Window.Resources>
-    <Grid Margin="20">
+    <Grid Margin="24,22,24,20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -926,16 +1211,23 @@ $WindowXaml = @'
         </Grid.RowDefinitions>
 
         <TextBlock Text="Captive Portal Connection Helper"
-                   FontSize="20"
+                   FontSize="18"
                    FontWeight="SemiBold"
-                   Foreground="#172033" />
+                   Foreground="#1A2332" />
 
-        <Border Grid.Row="1"
-                Margin="0,16,0,0"
+        <TextBlock Grid.Row="1"
+                   Margin="0,6,0,0"
+                   Foreground="#5E6874"
+                   FontSize="12"
+                   TextWrapping="Wrap"
+                   Text="Connect to the desired Wi-Fi network, then click Launch Logon Page to launch the authentication page." />
+
+        <Border Grid.Row="2"
+                Margin="0,18,0,0"
                 Background="White"
-                BorderBrush="#E1E6EC"
+                BorderBrush="#D5DBE3"
                 BorderThickness="1"
-                CornerRadius="8"
+                CornerRadius="6"
                 Padding="14,12">
             <Grid>
                 <Grid.ColumnDefinitions>
@@ -943,20 +1235,23 @@ $WindowXaml = @'
                     <ColumnDefinition Width="*" />
                 </Grid.ColumnDefinitions>
                 <Ellipse x:Name="StatusDot"
-                         Width="12"
-                         Height="12"
+                         Width="8"
+                         Height="8"
+                         Margin="0,5,0,0"
                          Fill="#9AA3AF"
-                         VerticalAlignment="Center"
+                         VerticalAlignment="Top"
                          AutomationProperties.AutomationId="WifiStatusDot" />
-                <StackPanel Grid.Column="1" Margin="12,0,0,0">
+                <StackPanel Grid.Column="1" Margin="10,0,0,0">
                     <TextBlock x:Name="StatusText"
                                Text="Checking Wi-Fi..."
+                               FontSize="13"
                                FontWeight="SemiBold"
-                               Foreground="#172033"
+                               Foreground="#1A2332"
                                AutomationProperties.AutomationId="WifiStatusText" />
                     <TextBlock x:Name="NetworkText"
-                               Margin="0,3,0,0"
-                               Foreground="#5E6A78"
+                               Margin="0,2,0,0"
+                               FontSize="12"
+                               Foreground="#5E6874"
                                TextWrapping="Wrap"
                                AutomationProperties.AutomationId="NetworkText" />
                 </StackPanel>
@@ -964,7 +1259,7 @@ $WindowXaml = @'
         </Border>
 
         <Button x:Name="OpenSignInButton"
-                Grid.Row="2"
+                Grid.Row="3"
                 Margin="0,16,0,0"
                 Style="{StaticResource SignInButtonStyle}"
                 Content="Launch Logon Page"
@@ -974,18 +1269,12 @@ $WindowXaml = @'
                 AutomationProperties.Name="Launch Logon Page" />
 
         <TextBlock x:Name="ResultText"
-                   Grid.Row="3"
+                   Grid.Row="4"
                    Margin="0,12,0,0"
+                   FontSize="12"
                    TextWrapping="Wrap"
                    Visibility="Collapsed"
                    AutomationProperties.AutomationId="ActionResultText" />
-
-        <TextBlock Grid.Row="4"
-                   Margin="0,12,0,0"
-                   Foreground="#5E6A78"
-                   FontSize="12"
-                   TextWrapping="Wrap"
-                   Text="Connect to the desired Wi-Fi network, then click Launch Logon Page to launch the authentication page." />
     </Grid>
 </Window>
 '@
