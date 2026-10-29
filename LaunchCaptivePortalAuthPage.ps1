@@ -4,9 +4,49 @@ Param(
     [Switch]$StaHost
 )
 
-$ErrorActionPreference = "Continue"
+$ErrorActionPreference = "Stop"
+$Script:LogLock = New-Object System.Object
+$Script:LastLoggedLinkState = ""
+$TempFolder = $Env:TEMP
+If ([String]::IsNullOrWhiteSpace($TempFolder)) {
+    $TempFolder = [System.IO.Path]::GetTempPath()
+}
+$Script:LogPath = Join-Path $TempFolder "LaunchCaptivePortalAuthPage.log"
+
+Function Write-SignInLog {
+    Param(
+        [String]$Message
+    )
+
+    If ([String]::IsNullOrWhiteSpace($Script:LogPath)) {
+        Return
+    }
+
+    $Stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    $Line = "[" + $Stamp + "] " + $Message + [System.Environment]::NewLine
+    [System.Threading.Monitor]::Enter($Script:LogLock)
+    Try {
+        $Utf8 = New-Object System.Text.UTF8Encoding $False
+        [System.IO.File]::AppendAllText($Script:LogPath, $Line, $Utf8)
+    }
+    Catch {
+    }
+    Finally {
+        [System.Threading.Monitor]::Exit($Script:LogLock)
+    }
+}
+
+[System.AppDomain]::CurrentDomain.Add_UnhandledException({
+    Param($Sender, $EventArgs)
+    $ExceptionText = ""
+    If ($Null -Ne $EventArgs.ExceptionObject) {
+        $ExceptionText = $EventArgs.ExceptionObject.ToString()
+    }
+    Write-SignInLog ("[ERROR] Process unhandled exception. Terminating=" + $EventArgs.IsTerminating + ". " + $ExceptionText)
+})
 
 If ([String]::IsNullOrWhiteSpace($PSCommandPath)) {
+    Write-SignInLog "[ERROR] Run this script from a file path."
     Write-Error "[ERROR] Run this script from a file path."
     Exit 1
 }
@@ -15,10 +55,12 @@ $IsDesktopHost = $PSVersionTable.PSEdition -Eq "Desktop"
 $IsStaThread = [System.Threading.Thread]::CurrentThread.ApartmentState -Eq [System.Threading.ApartmentState]::STA
 If (($IsDesktopHost -Eq $False) -Or ($IsStaThread -Eq $False)) {
     If ($StaHost -Eq $True) {
+        Write-SignInLog "[ERROR] WPF requires Windows PowerShell 5.1 running in STA mode."
         Write-Error "[ERROR] WPF requires Windows PowerShell 5.1 running in STA mode."
         Exit 1
     }
 
+    Write-SignInLog "[INFO] Restarting in Windows PowerShell STA. This process will exit."
     Write-Host "[INFO] Restarting in Windows PowerShell STA so WPF can open the window."
     $WindowsPowerShell = Join-Path $Env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
     $ArgumentList = @(
@@ -33,6 +75,8 @@ If (($IsDesktopHost -Eq $False) -Or ($IsStaThread -Eq $False)) {
     Start-Process -FilePath $WindowsPowerShell -ArgumentList $ArgumentList -WindowStyle Hidden | Out-Null
     Exit 0
 }
+
+Write-SignInLog ("[INFO] Sign-in script started. PID=" + $PID + ". ErrorAction=Stop.")
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -511,6 +555,69 @@ If ($Null -Eq ([System.Management.Automation.PSTypeName]"CiscoBrowserCloser").Ty
     Add-Type -TypeDefinition $CiscoBrowserSource -Language CSharp
 }
 
+$NetworkChangeRelaySource = @'
+using System;
+using System.Net.NetworkInformation;
+using System.Windows.Threading;
+
+public static class NetworkChangeRelay
+{
+    private static bool IsListening;
+    private static Dispatcher Dispatcher;
+    private static Action Callback;
+
+    public static void Start(Dispatcher dispatcher, Action callback)
+    {
+        Stop();
+        Dispatcher = dispatcher;
+        Callback = callback;
+        NetworkChange.NetworkAddressChanged += OnAddressChanged;
+        NetworkChange.NetworkAvailabilityChanged += OnAvailabilityChanged;
+        IsListening = true;
+    }
+
+    public static void Stop()
+    {
+        if (!IsListening)
+        {
+            return;
+        }
+
+        NetworkChange.NetworkAddressChanged -= OnAddressChanged;
+        NetworkChange.NetworkAvailabilityChanged -= OnAvailabilityChanged;
+        IsListening = false;
+        Callback = null;
+        Dispatcher = null;
+    }
+
+    private static void OnAddressChanged(object sender, EventArgs e)
+    {
+        Dispatch();
+    }
+
+    private static void OnAvailabilityChanged(object sender, NetworkAvailabilityEventArgs e)
+    {
+        Dispatch();
+    }
+
+    private static void Dispatch()
+    {
+        Dispatcher dispatcher = Dispatcher;
+        Action callback = Callback;
+        if (dispatcher == null || callback == null)
+        {
+            return;
+        }
+
+        dispatcher.BeginInvoke(callback);
+    }
+}
+'@
+
+If ($Null -Eq ([System.Management.Automation.PSTypeName]"NetworkChangeRelay").Type) {
+    Add-Type -TypeDefinition $NetworkChangeRelaySource -ReferencedAssemblies "WindowsBase" -Language CSharp
+}
+
 # Plain HTTP on a normal site. Connectivity-check hosts such as msftconnecttest.com
 # are often allowed through without showing the airline sign-in page.
 $Script:TriggerUrl = "http://neverssl.com"
@@ -574,10 +681,15 @@ Function Get-ConnectedWifiLabel {
 }
 
 Function Update-WifiStatus {
-    $Snapshot = [WifiMonitor]::Query()
-    $Script:LinkState = [String]$Snapshot.State
+    Try {
+        $Snapshot = [WifiMonitor]::Query()
+        $Script:LinkState = [String]$Snapshot.State
+        If ($Script:LinkState -Ne $Script:LastLoggedLinkState) {
+            Write-SignInLog ("[INFO] Wi-Fi state is " + $Script:LinkState + ". " + [String]$Snapshot.Detail)
+            $Script:LastLoggedLinkState = $Script:LinkState
+        }
 
-    Switch ($Script:LinkState) {
+        Switch ($Script:LinkState) {
         "Connected" {
             $Script:StatusDot.Fill = $Script:ConnectedBrush
             $Script:StatusText.Text = "Wi-Fi connected"
@@ -612,7 +724,13 @@ Function Update-WifiStatus {
         }
     }
 
-    Update-SignInButtonState
+        Update-SignInButtonState
+    }
+    Catch {
+        $StatusError = [String]$Error[0]
+        Write-SignInLog ("[ERROR] Wi-Fi status update failed: " + $StatusError)
+        Throw
+    }
 }
 
 Function Update-SignInButtonState {
@@ -708,7 +826,9 @@ Function Invoke-SignInPage {
 
     $Script:IsOpening = $True
     $Script:OpenSignInButton.IsEnabled = $False
+    Write-SignInLog "[INFO] Open sign-in page clicked."
     $CloseRequests = [CiscoBrowserCloser]::RequestClose()
+    Write-SignInLog ("[INFO] Cisco browser close requests=" + $CloseRequests)
     If ($CloseRequests -Gt 0) {
         Show-ActionResult -Message "Opening the sign-in page..." -Foreground $Script:WarningTextBrush
         $Script:CiscoCloseFinished = $False
@@ -732,9 +852,8 @@ Function Close-SignInWindow {
         $Script:CiscoCloseTimer.Stop()
     }
 
-    If ($Script:OnNetworkChanged -Ne $Null) {
-        [System.Net.NetworkInformation.NetworkChange]::Remove_NetworkAddressChanged($Script:OnNetworkChanged)
-        [System.Net.NetworkInformation.NetworkChange]::Remove_NetworkAvailabilityChanged($Script:OnNetworkChanged)
+    If ($Null -Ne ([System.Management.Automation.PSTypeName]"NetworkChangeRelay").Type) {
+        [NetworkChangeRelay]::Stop()
     }
 }
 
@@ -748,7 +867,7 @@ $Script:ErrorTextBrush = New-FrozenBrush -Red 0xA1 -Green 0x26 -Blue 0x22
 $WindowXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Captive portal sign-in"
+        Title="Captive Portal Connection Helper"
         Width="440"
         SizeToContent="Height"
         WindowStartupLocation="CenterScreen"
@@ -806,7 +925,7 @@ $WindowXaml = @'
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <TextBlock Text="Captive portal sign-in"
+        <TextBlock Text="Captive Portal Connection Helper"
                    FontSize="20"
                    FontWeight="SemiBold"
                    Foreground="#172033" />
@@ -848,11 +967,11 @@ $WindowXaml = @'
                 Grid.Row="2"
                 Margin="0,16,0,0"
                 Style="{StaticResource SignInButtonStyle}"
-                Content="Open sign-in page"
+                Content="Launch Logon Page"
                 IsEnabled="False"
                 IsDefault="True"
                 AutomationProperties.AutomationId="OpenSignInButton"
-                AutomationProperties.Name="Open sign-in page" />
+                AutomationProperties.Name="Launch Logon Page" />
 
         <TextBlock x:Name="ResultText"
                    Grid.Row="3"
@@ -866,7 +985,7 @@ $WindowXaml = @'
                    Foreground="#5E6A78"
                    FontSize="12"
                    TextWrapping="Wrap"
-                   Text="Connect to the desired Wi-Fi network, then click Open sign-in page to launch the authentication page." />
+                   Text="Connect to the desired Wi-Fi network, then click Launch Logon Page to launch the authentication page." />
     </Grid>
 </Window>
 '@
@@ -879,31 +998,55 @@ $Script:OpenSignInButton = $Script:Window.FindName("OpenSignInButton")
 $Script:ResultText = $Script:Window.FindName("ResultText")
 
 If (($Null -Eq $Script:StatusDot) -Or ($Null -Eq $Script:StatusText) -Or ($Null -Eq $Script:NetworkText) -Or ($Null -Eq $Script:OpenSignInButton) -Or ($Null -Eq $Script:ResultText)) {
+    Write-SignInLog "[ERROR] The sign-in window could not be loaded."
     Write-Error "[ERROR] The sign-in window could not be loaded."
     Exit 1
 }
 
 $Script:OpenSignInButton.Add_Click({ Invoke-SignInPage })
 $Script:Window.Add_Loaded({
+    Write-SignInLog "[INFO] Sign-in window loaded."
     Update-WifiStatus
     $Script:Timer.Start()
 })
 $Script:Window.Add_Activated({ Update-WifiStatus })
-$Script:Window.Add_Closed({ Close-SignInWindow })
+$Script:Window.Add_Closed({
+    Write-SignInLog "[INFO] Sign-in window Closed event."
+    Close-SignInWindow
+})
+$Script:Window.Dispatcher.Add_UnhandledException({
+    Param($Sender, $EventArgs)
+    $ExceptionText = ""
+    If ($Null -Ne $EventArgs.Exception) {
+        $ExceptionText = $EventArgs.Exception.ToString()
+    }
+    Write-SignInLog ("[ERROR] Dispatcher unhandled exception: " + $ExceptionText)
+})
+$Script:Window.Dispatcher.Add_ShutdownStarted({
+    Write-SignInLog "[INFO] Dispatcher shutdown started."
+})
 
 $Script:Timer = New-Object System.Windows.Threading.DispatcherTimer
 $Script:Timer.Interval = [TimeSpan]::FromSeconds(2)
 $Script:Timer.Add_Tick({ Update-WifiStatus })
 
 $Script:OnNetworkChanged = {
-    If ($Script:Window -Ne $Null) {
-        $Script:Window.Dispatcher.BeginInvoke([System.Action]{ Update-WifiStatus }) | Out-Null
-    }
+    Write-SignInLog "[INFO] Network change notification."
+    Update-WifiStatus
 }
-[System.Net.NetworkInformation.NetworkChange]::Add_NetworkAddressChanged($Script:OnNetworkChanged)
-[System.Net.NetworkInformation.NetworkChange]::Add_NetworkAvailabilityChanged($Script:OnNetworkChanged)
+[NetworkChangeRelay]::Start($Script:Window.Dispatcher, [System.Action]$Script:OnNetworkChanged)
 
+Write-SignInLog "[INFO] Opening the captive portal sign-in window."
 Write-Host "[INFO] Opening the captive portal sign-in window."
-$Script:Window.ShowDialog() | Out-Null
+Try {
+    $Script:Window.ShowDialog() | Out-Null
+    Write-SignInLog "[INFO] ShowDialog returned."
+}
+Catch {
+    $DialogError = [String]$Error[0]
+    Write-SignInLog ("[ERROR] ShowDialog ended with an error: " + $DialogError)
+    Write-Error "[ERROR] ShowDialog ended with an error: $DialogError"
+}
+Write-SignInLog "[INFO] Sign-in script is exiting."
 Write-Host "[INFO] Captive portal sign-in window closed."
 Exit 0
