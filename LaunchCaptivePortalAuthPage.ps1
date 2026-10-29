@@ -993,9 +993,9 @@ Function Get-SignInResultMessage {
         [String]$CiscoState
     )
 
-    $Lead = "Opened in your default browser."
+    $Lead = "Launching the authentication page in your default browser."
     If ($CiscoState -Eq "StillOpen") {
-        $Lead = "Opened in your default browser. If the sign-in page does not appear, try again."
+        $Lead = "Launching the authentication page in your default browser. If the sign-in page does not appear, try again."
     }
 
     If ($Script:LinkState -Eq "RadioOff") {
@@ -1089,6 +1089,23 @@ Function Invoke-SignInPage {
     Complete-SignInLaunch -CiscoState "None"
 }
 
+Function Move-SignInWindowToTopRight {
+    $Script:Window.UpdateLayout()
+    $WindowWidth = $Script:Window.ActualWidth
+    $WindowHeight = $Script:Window.ActualHeight
+    If ($WindowWidth -Le 0) {
+        $WindowWidth = $Script:Window.Width
+    }
+    If ($WindowHeight -Le 0) {
+        $WindowHeight = 240
+    }
+
+    $WorkArea = [System.Windows.SystemParameters]::WorkArea
+    $EdgeGap = 16
+    $Script:Window.Left = $WorkArea.Right - $WindowWidth - $EdgeGap
+    $Script:Window.Top = $WorkArea.Top + $EdgeGap
+}
+
 Function Start-FailoverNoticeMonitor {
     If ($Script:FailoverNoticeTimer -Ne $Null) {
         $Script:FailoverNoticeTimer.Stop()
@@ -1155,7 +1172,7 @@ $WindowXaml = @'
         Title="Captive Portal Connection Helper"
         Width="460"
         SizeToContent="Height"
-        WindowStartupLocation="CenterScreen"
+        WindowStartupLocation="Manual"
         Topmost="True"
         ResizeMode="CanMinimize"
         Background="#F5F6F8"
@@ -1166,7 +1183,7 @@ $WindowXaml = @'
         TextOptions.TextFormattingMode="Display">
     <Window.Resources>
         <Style x:Key="SignInButtonStyle" TargetType="Button">
-            <Setter Property="Background" Value="#1E4D7B" />
+            <Setter Property="Background" Value="#CA2420" />
             <Setter Property="Foreground" Value="White" />
             <Setter Property="FontSize" Value="13" />
             <Setter Property="FontWeight" Value="SemiBold" />
@@ -1186,10 +1203,10 @@ $WindowXaml = @'
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Border" Property="Background" Value="#173E64" />
+                                <Setter TargetName="Border" Property="Background" Value="#A81E1B" />
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
-                                <Setter TargetName="Border" Property="Background" Value="#12324F" />
+                                <Setter TargetName="Border" Property="Background" Value="#8E1916" />
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter TargetName="Border" Property="Background" Value="#E6E9ED" />
@@ -1235,13 +1252,13 @@ $WindowXaml = @'
                     <ColumnDefinition Width="*" />
                 </Grid.ColumnDefinitions>
                 <Ellipse x:Name="StatusDot"
-                         Width="8"
-                         Height="8"
-                         Margin="0,5,0,0"
+                         Width="16"
+                         Height="16"
+                         Margin="0,1,0,0"
                          Fill="#9AA3AF"
                          VerticalAlignment="Top"
                          AutomationProperties.AutomationId="WifiStatusDot" />
-                <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                <StackPanel Grid.Column="1" Margin="12,0,0,0">
                     <TextBlock x:Name="StatusText"
                                Text="Checking Wi-Fi..."
                                FontSize="13"
@@ -1294,6 +1311,7 @@ If (($Null -Eq $Script:StatusDot) -Or ($Null -Eq $Script:StatusText) -Or ($Null 
 
 $Script:OpenSignInButton.Add_Click({ Invoke-SignInPage })
 $Script:Window.Add_Loaded({
+    Move-SignInWindowToTopRight
     Write-SignInLog "[INFO] Sign-in window loaded."
     Update-WifiStatus
     $Script:Timer.Start()
